@@ -1,6 +1,6 @@
-import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List
+import re
 
 
 @dataclass
@@ -11,131 +11,88 @@ class Chunk:
     metadata: dict
 
 
-def normalize_text(text: str) -> str:
-    """Basic text cleanup: dehyphenation, whitespace normalization."""
-    # Remove hyphenation across line breaks
-    text = re.sub(r'-\s*\n\s*', '', text)
-    # Normalize whitespace
-    text = re.sub(r'\s+', ' ', text)
+def extract_header_from_chunk(chunk_text: str) -> str:
+    """Extract the most prominent header from a chunk using simple regex patterns."""
+    # Common header patterns
+    patterns = [
+        r'^#+\s+(.+)$',           # Markdown headers: ## Header
+        r'^\d+\.\d+\s+(.+)$',     # Numbered sections: 1.1 Header
+        r'^[A-Z][A-Z\s]{10,}$',   # ALL CAPS headers
+        r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*:$',  # Title Case: Header:
+    ]
+    
+    lines = chunk_text.split('\n')
+    for line in lines[:5]:  # Only check first 5 lines
+        line = line.strip()
+        if len(line) < 10:  # Skip very short lines
+            continue
+            
+        for pattern in patterns:
+            match = re.match(pattern, line, re.MULTILINE)
+            if match:
+                header = match.group(1).strip() if match.groups() else line.strip()
+                # Clean up the header
+                header = re.sub(r'[^\w\s-]', '', header)  # Remove special chars
+                return header[:50]  # Limit length
+    
+    return ""  # No header found
+
+
+def simple_chunk_text(text: str, file_name: str, chunk_size: int = 1000, overlap: int = 100) -> List[Chunk]:
+    """Simple text chunking - just split by character count with overlap."""
     text = text.strip()
-    return text
-
-
-def detect_headings(lines: List[str]) -> List[Tuple[int, int, str]]:
-    """Detect headings and return (line_idx, level, heading_text)."""
-    headings: List[Tuple[int, int, str]] = []
+    if not text:
+        return []
     
-    for i, line in enumerate(lines):
-        line = line.strip()
-        if not line:
-            continue
-            
-        # Markdown-style headings
-        if line.startswith('#'):
-            level = len(line) - len(line.lstrip('#'))
-            heading = line.lstrip('#').strip()
-            if heading:
-                headings.append((i, level, heading))
-            continue
-        
-        # Numbered headings: "1.", "1.1", "A.", "a)"
-        if re.match(r'^[0-9]+(\.[0-9]+)*\.?\s+[A-Z]', line):
-            level = line.count('.') + 1
-            heading = re.sub(r'^[0-9]+(\.[0-9]+)*\.?\s*', '', line)
-            headings.append((i, level, heading))
-            continue
-        
-        # Letter headings: "A.", "a)", "I.", "i)"
-        if re.match(r'^[A-Za-z]+[\.\)]\s+[A-Z]', line):
-            heading = re.sub(r'^[A-Za-z]+[\.\)]\s*', '', line)
-            headings.append((i, 2, heading))
-            continue
-        
-        # All caps lines (likely headings)
-        if len(line) > 5 and line.isupper() and not re.search(r'[0-9]{3,}', line):
-            headings.append((i, 1, line))
-            continue
+    chunks = []
+    start = 0
+    chunk_index = 0
     
-    return headings
-
-
-def build_heading_path(headings: List[Tuple[int, int, str]], current_line: int) -> List[str]:
-    """Build hierarchical heading path for current line position."""
-    path: List[str] = []
-    active_headings: List[Tuple[int, str]] = []  # (level, text)
-    
-    for line_idx, level, text in headings:
-        if line_idx >= current_line:
-            break
+    while start < len(text):
+        end = start + chunk_size
         
-        # Remove headings at same or deeper level
-        active_headings = [(l, t) for l, t in active_headings if l < level]
-        active_headings.append((level, text))
-    
-    return [text for _, text in active_headings]
-
-
-def chunk_text_by_headers(text: str, file_name: str, target_tokens: int = 200, overlap_ratio: float = 0.15) -> List[Chunk]:
-    """Split text into chunks respecting heading boundaries."""
-    text = normalize_text(text)
-    lines = text.split('\n')
-    headings = detect_headings(lines)
-    
-    chunks: List[Chunk] = []
-    current_chunk = []
-    current_tokens = 0
-    chunk_id = 0
-    
-    for i, line in enumerate(lines):
-        line = line.strip()
-        if not line:
-            continue
+        # If we're not at the end, try to break at a sentence or paragraph
+        if end < len(text):
+            # Look for paragraph break first
+            para_break = text.rfind('\n\n', start, end)
+            if para_break != -1 and para_break > start + chunk_size // 2:
+                end = para_break + 2
+            else:
+                # Look for sentence break
+                sent_break = text.rfind('. ', start, end)
+                if sent_break != -1 and sent_break > start + chunk_size // 2:
+                    end = sent_break + 2
         
-        # Estimate tokens (rough: words * 1.3)
-        line_tokens = int(len(line.split()) * 1.3)
-        
-        # Check if we need to split
-        if current_tokens + line_tokens > target_tokens and current_chunk:
-            # Create chunk
-            chunk_text = '\n'.join(current_chunk).strip()
-            if chunk_text:
-                heading_path = build_heading_path(headings, i)
-                chunks.append(Chunk(
-                    id=f"{file_name}:chunk:{chunk_id}",
-                    text=chunk_text,
-                    heading_path=heading_path,
-                    metadata={
-                        "source_file": file_name,
-                        "chunk_index": chunk_id,
-                        "heading_path": " > ".join(heading_path) if heading_path else "",
-                        "token_count": current_tokens
-                    }
-                ))
-                chunk_id += 1
-            
-            # Start new chunk with overlap
-            overlap_lines = int(len(current_chunk) * overlap_ratio)
-            current_chunk = current_chunk[-overlap_lines:] if overlap_lines > 0 else []
-            current_tokens = sum(int(len(l.split()) * 1.3) for l in current_chunk)
-        
-        current_chunk.append(line)
-        current_tokens += line_tokens
-    
-    # Final chunk
-    if current_chunk:
-        chunk_text = '\n'.join(current_chunk).strip()
+        chunk_text = text[start:end].strip()
         if chunk_text:
-            heading_path = build_heading_path(headings, len(lines))
+            # Extract header from this chunk
+            header = extract_header_from_chunk(chunk_text)
+            
             chunks.append(Chunk(
-                id=f"{file_name}:chunk:{chunk_id}",
+                id=f"{file_name}:chunk:{chunk_index}",
                 text=chunk_text,
-                heading_path=heading_path,
+                heading_path=[header] if header else [],
                 metadata={
                     "source_file": file_name,
-                    "chunk_index": chunk_id,
-                    "heading_path": " > ".join(heading_path) if heading_path else "",
-                    "token_count": current_tokens
+                    "chunk_index": chunk_index,
+                    "heading_path": header,
+                    "char_start": start,
+                    "char_end": end,
+                    "char_count": len(chunk_text)
                 }
             ))
+            chunk_index += 1
+        
+        # Move start position with overlap
+        start = max(start + chunk_size - overlap, end)
     
     return chunks
+
+
+def chunk_text_by_headers(text: str, file_name: str, target_tokens: int = 50, overlap_ratio: float = 0.25) -> List[Chunk]:
+    """Simple chunking with basic header detection from chunk content."""
+    # Convert token target to character estimate (roughly 4 chars per token)
+    chunk_size = target_tokens * 6
+    overlap = int(chunk_size * overlap_ratio)
+    
+    return simple_chunk_text(text, file_name, chunk_size, overlap)
