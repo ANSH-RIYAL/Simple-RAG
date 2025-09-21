@@ -1,12 +1,14 @@
 import os
 import shutil
+import json
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pypdf import PdfReader
 from dotenv import load_dotenv
+import requests
 
 from src.rag.embeddings import MistralEmbeddingsClient
 from src.rag.vector_store import SimpleVectorStore
@@ -50,22 +52,91 @@ app = FastAPI(title="Simple Vector DB API")
 _store: SimpleVectorStore | None = None
 _files_indexed: List[str] = []
 _embedder: MistralEmbeddingsClient | None = None
+_OPENAI_API_KEY: Optional[str] = None
+_OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+
+# ---------------- OpenAI helpers ---------------- #
+
+def _openai_headers() -> dict:
+    if not _OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set in .env or environment")
+    return {
+        "Authorization": f"Bearer {_OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def _openai_chat_json(system_prompt: str, user_prompt: str) -> dict:
+    url = "https://api.openai.com/v1/chat/completions"
+    payload = {
+        "model": _OPENAI_MODEL,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 300,
+    }
+    resp = requests.post(url, headers=_openai_headers(), json=payload, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenAI API error {resp.status_code}: {resp.text}")
+    data = resp.json()
+    content = data["choices"][0]["message"]["content"]
+    try:
+        return json.loads(content)
+    except Exception as e:
+        raise RuntimeError(f"OpenAI response not JSON: {content}") from e
+
+
+def classify_intent_via_openai(query: str) -> dict:
+    system = (
+        "You are a classifier for routing queries in a RAG system."
+        " Always return strict JSON only."
+        " Fields: intent (one of: Chit-chat, KB_QA, List, Table),"
+        " knowledge_base_requirement (0-10 integer), comments (string)."
+    )
+    user = (
+        "Classify the user query."
+        " Return JSON with keys: intent, knowledge_base_requirement, comments.\n\n"
+        f"Query: {query}"
+    )
+    return _openai_chat_json(system, user)
+
+
+def rewrite_query_via_openai(query: str) -> dict:
+    system = (
+        "You are a query rewriter to improve retrieval for a RAG system."
+        " Normalize, keep key entities, expand with 2-6 high-value synonyms/aliases,"
+        " remove fluff. Output concise retrieval query. Return strict JSON only with:"
+        " rewritten_query (string), keywords (array of strings), notes (string)."
+    )
+    user = (
+        "Rewrite the query for retrieval. JSON only. Fields: rewritten_query, keywords, notes.\n\n"
+        f"Query: {query}"
+    )
+    return _openai_chat_json(system, user)
 
 
 @app.on_event("startup")
 def startup_event() -> None:
-    global _store, _files_indexed, _embedder
+    global _store, _files_indexed, _embedder, _OPENAI_API_KEY
 
     # Load .env from same directory as this file
     env_path = Path(__file__).parent / ".env"
     if env_path.exists():
         load_dotenv(dotenv_path=str(env_path))
 
-    # Ensure API key is present (from .env or environment)
+    # Ensure keys are present (from .env or environment)
     api_key = os.getenv("MISTRAL_API_KEY")
     if not api_key:
         raise RuntimeError("MISTRAL_API_KEY not set. Create src/api/.env with MISTRAL_API_KEY=...")
     _embedder = MistralEmbeddingsClient(api_key=api_key)
+
+    _OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    if not _OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set. Add to src/api/.env as OPENAI_API_KEY=...")
 
     # Reset index directory
     if INDEX_DIR.exists():
@@ -98,7 +169,6 @@ def startup_event() -> None:
             continue
 
     if not texts:
-        # Initialize empty store with a default dim to avoid None; will error on search if empty
         _store = None
         return
 
@@ -119,7 +189,31 @@ def list_files() -> dict:
 def search(req: SearchRequest) -> List[SearchResult]:
     if _store is None or _embedder is None:
         raise HTTPException(status_code=503, detail="Index not ready or empty")
-    qvec = _embedder.embed_texts([req.query])[0]
+
+    # LLM-based intent classification
+    cls = classify_intent_via_openai(req.query)
+    intent = str(cls.get("intent", "")).strip().lower()
+    # parse knowledge_base_requirement (supports "7/10" or 7)
+    kb_req_raw = cls.get("knowledge_base_requirement", 0)
+    kb_score = 0
+    try:
+        if isinstance(kb_req_raw, str) and "/" in kb_req_raw:
+            kb_score = int(kb_req_raw.split("/", 1)[0])
+        else:
+            kb_score = int(kb_req_raw)
+    except Exception:
+        kb_score = 0
+
+    # If not suitable for KB search, return empty results
+    if intent in ("chit-chat", "chitchat") or kb_score < 4:
+        return []
+
+    # LLM-based query rewrite
+    rew = rewrite_query_via_openai(req.query)
+    rewritten_query = str(rew.get("rewritten_query", req.query)) or req.query
+
+    # Embed rewritten query and search
+    qvec = _embedder.embed_texts([rewritten_query])[0]
     results = _store.search(qvec, top_k=req.top_k)
     out: List[SearchResult] = []
     for r in results:
