@@ -51,10 +51,23 @@ class SearchResult(BaseModel):
     heading_path: str = ""
 
 
+class HallucinationStatement(BaseModel):
+    statement: str
+    evidence_rating: int
+    explanation: str
+
+
+class HallucinationAnalysis(BaseModel):
+    statements: List[HallucinationStatement]
+    overall_hallucination_risk: str
+
+
 class ChatResponse(BaseModel):
     query: str
     response: str
     chunks_retrieved: List[SearchResult]
+    hallucination_analysis: Optional[HallucinationAnalysis] = None
+    pii_detection: Optional[dict] = None
 
 
 app = FastAPI(title="Simple RAG API")
@@ -122,14 +135,21 @@ def _openai_chat_text(system_prompt: str, user_prompt: str, max_tokens: int = 80
 
 
 def classify_intent_via_openai(query: str) -> dict:
+    # Get current knowledge base files for context
+    kb_files = _files_indexed if _files_indexed else ["No documents uploaded"]
+    kb_context = ", ".join(kb_files)
+    
     system = (
         "You are a classifier for routing queries in a RAG system."
         " Always return strict JSON only."
         " Fields: intent (one of: Chit-chat, KB_QA, List, Table),"
         " knowledge_base_requirement (0-10 integer), comments (string)."
+        f" Current knowledge base contains: {kb_context}"
+        " If the query relates to topics in the knowledge base, use KB_QA."
+        " If it's general conversation unrelated to the knowledge base, use Chit-chat."
     )
     user = (
-        "Classify the user query."
+        "Classify the user query based on whether it needs the knowledge base."
         " Return JSON with keys: intent, knowledge_base_requirement, comments.\n\n"
         f"Query: {query}"
     )
@@ -148,6 +168,97 @@ def rewrite_query_via_openai(query: str) -> dict:
         f"Query: {query}"
     )
     return _openai_chat_json(system, user)
+
+
+def detect_hallucinations_via_openai(response: str, chunks: List[SearchResult]) -> dict:
+    """Detect potential hallucinations by checking each statement against retrieved chunks."""
+    
+    # Prepare context from chunks
+    context_text = "\n\n".join([
+        f"[Source: {chunk.source_file}]\n{chunk.text}" 
+        for chunk in chunks
+    ])
+    
+    system = (
+        "You are a hallucination detector for RAG systems. "
+        "Analyze each statement in the response and check if it's supported by the provided context. "
+        "Return strict JSON only with this exact structure:\n"
+        "{\n"
+        '  "statements": [\n'
+        '    {\n'
+        '      "statement": "exact text of the statement",\n'
+        '      "evidence_rating": 8,\n'
+        '      "explanation": "why this rating was assigned"\n'
+        '    }\n'
+        '  ],\n'
+        '  "overall_hallucination_risk": "low|medium|high"\n'
+        "}\n"
+        "Rate each statement from 1-10 where:\n"
+        "- 10: Directly stated in context with exact match\n"
+        "- 8-9: Strongly supported by context (inference from facts)\n"
+        "- 6-7: Moderately supported (some evidence)\n"
+        "- 4-5: Weakly supported (limited evidence)\n"
+        "- 1-3: Not supported or contradicted by context\n"
+        "Break down the response into individual factual statements."
+    )
+    
+    user = (
+        f"Response to analyze:\n{response}\n\n"
+        f"Context from retrieved chunks:\n{context_text}\n\n"
+        "Analyze each statement and provide evidence ratings. JSON only."
+    )
+    
+    return _openai_chat_json(system, user, max_tokens=800)
+
+
+def detect_pii_in_query(query: str) -> dict:
+    """Detect PII in user query using regex and keyword matching."""
+    import re
+    
+    # PII patterns
+    patterns = {
+        'email': r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+        'phone': r'(\+?1[-.\s]?)?\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}',
+        'ssn': r'\b\d{3}-?\d{2}-?\d{4}\b',
+        'credit_card': r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b',
+        'address': r'\b\d+\s+[A-Za-z\s]+(?:Street|St|Avenue|Ave|Road|Rd|Lane|Ln|Drive|Dr|Boulevard|Blvd)\b'
+    }
+    
+    # PII keywords
+    pii_keywords = [
+        'password', 'pin', 'social security', 'credit card', 'bank account',
+        'routing number', 'account number', 'driver license', 'passport',
+        'date of birth', 'mother maiden name', 'personal information',
+        'private data', 'confidential', 'secret', 'ssn', 'sin'
+    ]
+    
+    detected_pii = {}
+    query_lower = query.lower()
+    
+    # Check regex patterns
+    for pii_type, pattern in patterns.items():
+        matches = re.findall(pattern, query, re.IGNORECASE)
+        if matches:
+            detected_pii[pii_type] = matches
+    
+    # Check keywords
+    found_keywords = []
+    for keyword in pii_keywords:
+        if keyword in query_lower:
+            found_keywords.append(keyword)
+    
+    if found_keywords:
+        detected_pii['keywords'] = found_keywords
+    
+    has_pii = len(detected_pii) > 0
+    risk_level = "high" if has_pii else "none"
+    
+    return {
+        "has_pii": has_pii,
+        "risk_level": risk_level,
+        "detected_types": list(detected_pii.keys()),
+        "details": detected_pii
+    }
 
 
 def build_index_from_pdfs():
@@ -175,6 +286,9 @@ def build_index_from_pdfs():
             chunks = chunk_text_by_headers(text, pdf.name)
             if chunks:
                 print(f"  Created {len(chunks)} chunks from {pdf.name}")
+                for i, chunk in enumerate(chunks[:3]):  # Show first 3 chunks
+                    print(f"    Chunk {i}: {len(chunk.text)} chars, tokens: {chunk.metadata.get('token_count', 'unknown')}")
+                    print(f"    Preview: {chunk.text[:100]}...")
                 all_chunks.extend(chunks)
                 _files_indexed.append(pdf.name)
             else:
@@ -353,7 +467,7 @@ def search(req: SearchRequest) -> List[SearchResult]:
     # Hybrid fusion with threshold
     fused_results = hybrid_search(
         semantic_results, tfidf_results, _chunk_texts, 
-        req.query, threshold=0.3  # Lowered threshold
+        req.query, threshold=0.3
     )
 
     print(f"\n\n=== HYBRID FUSION ===")
@@ -383,7 +497,26 @@ def search(req: SearchRequest) -> List[SearchResult]:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
-    """Chat endpoint with RAG generation."""
+    """Chat endpoint with RAG generation, PII detection, and hallucination analysis."""
+    
+    print(f"\n\n=== CHAT REQUEST ===")
+    print(f"Query: {req.query}")
+    
+    # PII Detection
+    pii_detection = detect_pii_in_query(req.query)
+    print(f"\n\n=== PII DETECTION ===")
+    print(f"Has PII: {pii_detection['has_pii']}")
+    print(f"Risk Level: {pii_detection['risk_level']}")
+    print(f"Detected Types: {pii_detection['detected_types']}")
+    
+    if pii_detection['has_pii']:
+        response_text = "I cannot process queries containing personal identifiable information (PII). Please remove any personal details and try again."
+        return ChatResponse(
+            query=req.query,
+            response=response_text,
+            chunks_retrieved=[],
+            pii_detection=pii_detection
+        )
     
     # Get search results using same logic as /search
     search_req = SearchRequest(query=req.query, top_k=req.top_k)
@@ -395,7 +528,8 @@ def chat(req: ChatRequest) -> ChatResponse:
         return ChatResponse(
             query=req.query,
             response=response_text,
-            chunks_retrieved=[]
+            chunks_retrieved=[],
+            pii_detection=pii_detection
         )
     
     # Generate response using OpenAI
@@ -423,8 +557,39 @@ Please provide a comprehensive answer based on the context above."""
     except Exception as e:
         response_text = f"Error generating response: {str(e)}"
     
+    # Hallucination Detection
+    hallucination_analysis = None
+    try:
+        print(f"\n\n=== HALLUCINATION ANALYSIS ===")
+        hallucination_result = detect_hallucinations_via_openai(response_text, chunks)
+        
+        # Convert to Pydantic model
+        statements = [
+            HallucinationStatement(
+                statement=stmt["statement"],
+                evidence_rating=stmt["evidence_rating"],
+                explanation=stmt["explanation"]
+            )
+            for stmt in hallucination_result["statements"]
+        ]
+        
+        hallucination_analysis = HallucinationAnalysis(
+            statements=statements,
+            overall_hallucination_risk=hallucination_result["overall_hallucination_risk"]
+        )
+        
+        print(f"Overall Risk: {hallucination_analysis.overall_hallucination_risk}")
+        print(f"Statements Analyzed: {len(statements)}")
+        for stmt in statements:
+            print(f"  Rating: {stmt.evidence_rating}/10 - {stmt.statement[:50]}...")
+            
+    except Exception as e:
+        print(f"Hallucination analysis failed: {e}")
+    
     return ChatResponse(
         query=req.query,
         response=response_text,
-        chunks_retrieved=chunks
+        chunks_retrieved=chunks,
+        hallucination_analysis=hallucination_analysis,
+        pii_detection=pii_detection
     )

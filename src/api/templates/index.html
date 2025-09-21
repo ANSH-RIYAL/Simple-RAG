@@ -18,6 +18,16 @@
         button { padding: 10px 15px; margin: 5px; cursor: pointer; }
         #fileList { margin-top: 10px; }
         .file-item { padding: 5px; border-bottom: 1px solid #eee; }
+        .statement { border: 1px solid #ddd; margin: 10px 0; padding: 10px; border-radius: 5px; }
+        .evidence-rating { font-weight: bold; padding: 5px 10px; border-radius: 3px; display: inline-block; margin-right: 10px; }
+        .rating-high { background-color: #d4edda; color: #155724; } /* 8-10: Green */
+        .rating-medium { background-color: #fff3cd; color: #856404; } /* 5-7: Yellow */
+        .rating-low { background-color: #f8d7da; color: #721c24; } /* 1-4: Red */
+        .risk-indicator { padding: 5px 10px; border-radius: 3px; font-weight: bold; }
+        .risk-low { background-color: #d4edda; color: #155724; }
+        .risk-medium { background-color: #fff3cd; color: #856404; }
+        .risk-high { background-color: #f8d7da; color: #721c24; }
+        .pii-warning { background-color: #f8d7da; color: #721c24; padding: 10px; border-radius: 5px; margin: 10px 0; }
     </style>
 </head>
 <body>
@@ -50,6 +60,12 @@
                 <h3>Retrieved Chunks</h3>
                 <div id="chunksDisplay">No chunks retrieved yet.</div>
             </div>
+        </div>
+        
+        <!-- Hallucination Detection Section -->
+        <div class="hallucination-section" style="border: 1px solid #ccc; padding: 15px; margin-top: 20px;">
+            <h3>Hallucination Analysis</h3>
+            <div id="hallucinationDisplay">No analysis available yet.</div>
         </div>
     </div>
 
@@ -139,11 +155,20 @@
 
                 const data = await response.json();
                 
-                // Add bot response to chat
-                addMessage(data.response, 'bot');
-                
-                // Update chunks display
-                displayChunks(data.chunks_retrieved);
+                // Check for PII detection
+                if (data.pii_detection && data.pii_detection.has_pii) {
+                    addMessage(`⚠️ PII Detected: ${data.pii_detection.detected_types.join(', ')}`, 'bot');
+                    displayPiiWarning(data.pii_detection);
+                } else {
+                    // Add bot response to chat
+                    addMessage(data.response, 'bot');
+                    
+                    // Update chunks display
+                    displayChunks(data.chunks_retrieved);
+                    
+                    // Update hallucination analysis
+                    displayHallucinationAnalysis(data.hallucination_analysis);
+                }
                 
             } catch (error) {
                 addMessage('Error: ' + error.message, 'bot');
@@ -154,7 +179,7 @@
             const chatMessages = document.getElementById('chatMessages');
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${type}-message`;
-            messageDiv.textContent = text;
+            messageDiv.innerHTML = text.replace(/\n/g, '<br>');
             chatMessages.appendChild(messageDiv);
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
@@ -175,6 +200,63 @@
                     <div style="font-size: 0.9em;">${chunk.text.substring(0, 300)}${chunk.text.length > 300 ? '...' : ''}</div>
                 </div>
             `).join('');
+        }
+
+        function displayPiiWarning(piiDetection) {
+            const chunksDisplay = document.getElementById('chunksDisplay');
+            const hallucinationDisplay = document.getElementById('hallucinationDisplay');
+            
+            chunksDisplay.innerHTML = `
+                <div class="pii-warning">
+                    <strong>⚠️ Personal Identifiable Information (PII) Detected</strong><br>
+                    Detected types: ${piiDetection.detected_types.join(', ')}<br>
+                    Risk level: ${piiDetection.risk_level}
+                </div>
+            `;
+            
+            hallucinationDisplay.innerHTML = '<div>Hallucination analysis skipped due to PII detection.</div>';
+        }
+
+        function displayHallucinationAnalysis(analysis) {
+            const hallucinationDisplay = document.getElementById('hallucinationDisplay');
+            
+            if (!analysis || !analysis.statements || analysis.statements.length === 0) {
+                hallucinationDisplay.innerHTML = '<div>No hallucination analysis available.</div>';
+                return;
+            }
+
+            const riskClass = `risk-${analysis.overall_hallucination_risk}`;
+            
+            let html = `
+                <div style="margin-bottom: 15px;">
+                    <strong>Overall Hallucination Risk: </strong>
+                    <span class="risk-indicator ${riskClass}">${analysis.overall_hallucination_risk.toUpperCase()}</span>
+                </div>
+            `;
+
+            html += analysis.statements.map(statement => {
+                const rating = statement.evidence_rating;
+                let ratingClass = 'rating-low';
+                if (rating >= 8) ratingClass = 'rating-high';
+                else if (rating >= 5) ratingClass = 'rating-medium';
+                
+                return `
+                    <div class="statement">
+                        <div style="margin-bottom: 8px;">
+                            <span class="evidence-rating ${ratingClass}">${rating}/10</span>
+                            <strong>Evidence Rating</strong>
+                        </div>
+                        <div style="margin-bottom: 8px; font-style: italic;">
+                            "${statement.statement}"
+                        </div>
+                        <div style="font-size: 0.9em; color: #666;">
+                            ${statement.explanation}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            hallucinationDisplay.innerHTML = html;
         }
     </script>
 </body>
