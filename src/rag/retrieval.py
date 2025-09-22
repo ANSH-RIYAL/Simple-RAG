@@ -15,9 +15,10 @@ class TFIDFIndex:
         self.doc_count = 0
     
     def tokenize(self, text: str) -> List[str]:
-        """Basic tokenization: lowercase, alphanumeric only, min length 2."""
+        """Basic tokenization: lowercase, alphanumeric + common chars, min length 2."""
         import re
-        tokens = re.findall(r'[a-zA-Z0-9]{2,}', text.lower())
+        # Include hyphens and underscores, split on whitespace and punctuation
+        tokens = re.findall(r'[a-zA-Z0-9_-]{2,}', text.lower())
         return tokens
     
     def build_index(self, documents: List[str]) -> None:
@@ -68,7 +69,7 @@ class TFIDFIndex:
         
         tokens = self.tokenize(query)
         token_counts = Counter(tokens)
-        query_length = len(tokens)
+        # query_length = len(tokens)
         
         query_vec = np.zeros(len(self.vocabulary), dtype=np.float32)
         for token, count in token_counts.items():
@@ -83,17 +84,25 @@ class TFIDFIndex:
     def search(self, query: str, top_k: int = 10) -> List[Tuple[int, float]]:
         """Search documents using TF-IDF cosine similarity."""
         if self.doc_count == 0:
+            print(f"TF-IDF: No documents indexed")
             return []
+        
+        query_tokens = self.tokenize(query)
+        print(f"TF-IDF: Query tokens: {query_tokens}")
         
         query_vec = self.query_vector(query)
         if query_vec.size == 0:
+            print(f"TF-IDF: Empty query vector")
             return []
+        
+        print(f"TF-IDF: Query vector non-zero elements: {np.count_nonzero(query_vec)}")
         
         # Cosine similarity
         doc_norms = np.linalg.norm(self.tf_matrix, axis=1)
         query_norm = np.linalg.norm(query_vec)
         
         if query_norm == 0:
+            print(f"TF-IDF: Zero query norm")
             return []
         
         similarities = np.zeros(self.doc_count)
@@ -101,9 +110,13 @@ class TFIDFIndex:
             if doc_norms[i] > 0:
                 similarities[i] = np.dot(self.tf_matrix[i], query_vec) / (doc_norms[i] * query_norm)
         
-        # Get top-k results
+        print(f"TF-IDF: Max similarity: {np.max(similarities):.4f}")
+        
+        # Get top-k results with lower threshold
         top_indices = np.argsort(-similarities)[:top_k]
-        return [(int(idx), float(similarities[idx])) for idx in top_indices if similarities[idx] > 0]
+        results = [(int(idx), float(similarities[idx])) for idx in top_indices if similarities[idx] > 0.01]  # Lower threshold
+        print(f"TF-IDF: Returning {len(results)} results")
+        return results
 
 
 def hybrid_search(

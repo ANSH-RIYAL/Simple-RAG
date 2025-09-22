@@ -1,0 +1,3 @@
+needed to add this so static folder remains in the directory structure when cloned.
+Alternative was to force a command to mkdir the static subdir at src/api but didn't want to do that.
+other alternative - making shell script felt overkill

@@ -145,8 +145,9 @@ def classify_intent_via_openai(query: str) -> dict:
         " Fields: intent (one of: Chit-chat, KB_QA, List, Table),"
         " knowledge_base_requirement (0-10 integer), comments (string)."
         f" Current knowledge base contains: {kb_context}"
-        " If the query relates to topics in the knowledge base, use KB_QA."
-        " If it's general conversation unrelated to the knowledge base, use Chit-chat."
+        " Use KB_QA for ANY query that could benefit from document context, even tangentially."
+        " Only use Chit-chat for pure greetings, casual conversation, or completely unrelated topics."
+        " Be liberal in routing to KB_QA - better to search and find nothing than miss relevant content."
     )
     user = (
         "Classify the user query based on whether it needs the knowledge base."
@@ -171,7 +172,7 @@ def rewrite_query_via_openai(query: str) -> dict:
 
 
 def detect_hallucinations_via_openai(response: str, chunks: List[SearchResult]) -> dict:
-    """Detect potential hallucinations by checking each statement against retrieved chunks."""
+    """Detect potential hallucinations by checking key statements against retrieved chunks."""
     
     # Prepare context from chunks
     context_text = "\n\n".join([
@@ -181,12 +182,13 @@ def detect_hallucinations_via_openai(response: str, chunks: List[SearchResult]) 
     
     system = (
         "You are a hallucination detector for RAG systems. "
-        "Analyze each statement in the response and check if it's supported by the provided context. "
+        "Analyze the response and identify the 3-5 most important factual statements or claims. "
+        "Group similar statements together into topics if appropriate. "
         "Return strict JSON only with this exact structure:\n"
         "{\n"
         '  "statements": [\n'
         '    {\n'
-        '      "statement": "exact text of the statement",\n'
+        '      "statement": "summary of the key claim or topic",\n'
         '      "evidence_rating": 8,\n'
         '      "explanation": "why this rating was assigned"\n'
         '    }\n'
@@ -199,16 +201,16 @@ def detect_hallucinations_via_openai(response: str, chunks: List[SearchResult]) 
         "- 6-7: Moderately supported (some evidence)\n"
         "- 4-5: Weakly supported (limited evidence)\n"
         "- 1-3: Not supported or contradicted by context\n"
-        "Break down the response into individual factual statements."
+        "Focus on the most important claims, group related statements, and provide 3-5 key assessments maximum."
     )
     
     user = (
         f"Response to analyze:\n{response}\n\n"
         f"Context from retrieved chunks:\n{context_text}\n\n"
-        "Analyze each statement and provide evidence ratings. JSON only."
+        "Identify the 3-5 most important factual claims and assess their evidence. JSON only."
     )
     
-    return _openai_chat_json(system, user, max_tokens=800)
+    return _openai_chat_json(system, user, max_tokens=600)
 
 
 def detect_pii_in_query(query: str) -> dict:
@@ -432,9 +434,9 @@ def search(req: SearchRequest) -> List[SearchResult]:
     print(f"Comments: {cls.get('comments', 'N/A')}")
 
     # If not suitable for KB search, return empty results
-    if intent in ("chit-chat", "chitchat") or kb_score < 4:
+    if intent in ("chit-chat", "chitchat") or kb_score < 2:
         print(f"\n\n=== SEARCH SKIPPED ===")
-        print(f"Reason: Intent '{intent}' or KB score {kb_score} < 4")
+        print(f"Reason: Intent '{intent}' or KB score {kb_score} < 2")
         return []
 
     # LLM-based query rewrite
@@ -524,7 +526,11 @@ def chat(req: ChatRequest) -> ChatResponse:
     
     if not chunks:
         # No relevant chunks found
-        response_text = "I don't have sufficient information in my knowledge base to answer this question. Please try rephrasing or ask about topics covered in the uploaded documents."
+        kb_files = _files_indexed if _files_indexed else []
+        if kb_files:
+            response_text = f"I couldn't find specific information about '{req.query}' in my knowledge base. The available documents are: {', '.join(kb_files)}. You might try rephrasing your question or asking about topics covered in these documents."
+        else:
+            response_text = "I don't have any documents in my knowledge base yet. Please upload some PDF files first using the upload feature."
         return ChatResponse(
             query=req.query,
             response=response_text,
@@ -540,9 +546,11 @@ def chat(req: ChatRequest) -> ChatResponse:
     
     system_prompt = (
         "You are a helpful assistant that answers questions based on provided context. "
-        "Use only the information from the context to answer questions. "
-        "If the context doesn't contain enough information, say so. "
-        "Always cite sources in your response using [Source: filename] format."
+        "Use the information from the context to provide comprehensive answers. "
+        "When the context contains relevant information, provide a detailed response even if it doesn't cover every aspect of the question. "
+        "If the context has partial information, acknowledge what you can answer and what might need additional sources. "
+        "Always cite sources in your response using [Source: filename] format. "
+        "Be helpful and informative rather than overly cautious."
     )
     
     user_prompt = f"""Context:
@@ -550,7 +558,9 @@ def chat(req: ChatRequest) -> ChatResponse:
 
 Question: {req.query}
 
-Please provide a comprehensive answer based on the context above."""
+Based on the provided context, please provide a helpful and informative answer. 
+Use all relevant information from the context, even if it doesn't completely answer every aspect of the question.
+If the context provides partial information, explain what you can tell from the available information and note any gaps."""
     
     try:
         response_text = _openai_chat_text(system_prompt, user_prompt, max_tokens=800)
